@@ -75,13 +75,7 @@ pip install -r requirements.txt
 
 ### 4. 配置环境变量
 
-复制模板并编辑 `.env` 文件：
-
-```bash
-cp .env.example .env
-```
-
-填入你的 API 密钥：
+新建 `.env` 文件：
 
 ```ini
 LLM_PROVIDER=gemma4
