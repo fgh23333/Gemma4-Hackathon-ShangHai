@@ -8,212 +8,242 @@
 
 程序员生活节奏快、压力大，经常忘记点饭、凭情绪暴饮暴食、不知不觉超预算。本智能体通过 **8 个专业 Agent 的圆桌辩论**，自主完成营养分析、预算控制、习惯学习、下单推荐全流程，成为用户的"饮食营养伴随"。
 
-### 与 Gemma 4 的深度结合
-
-| Gemma 4 能力 | 本项目实现 |
-|-------------|-----------|
-| **原生函数调用 (Native Function Calling)** | Agent 通过 Function Calling 自动选择工具：查询菜单、获取营养、计算价格、创建订单 |
-| **多步规划 (Multi-step Planning)** | Orchestrator 根据用户场景动态调度 3-5 个 Agent，并行分析后 4 阶段辩论 |
-| **Agent Memory** | SQLite 持久化饮食偏好/习惯模式/预算行为，持续学习用户画像 |
-| **Tool Calling** | 麦当劳 MCP 接入真实菜单/价格/下单 API，实现自主下单闭环 |
+**核心价值**：不是简单的菜单推荐，而是多 Agent 从健康、预算、情绪、安全等维度**辩论后**给出有理有据的饮食建议，并通过 Tool Calling 实现自主下单闭环。
 
 ---
 
-## 核心架构
+## 🎯 Gemma 4 深度利用
 
-### 决策流程
+### Native Function Calling
+
+本项目的 **核心不是 Prompt 工程**，而是深度利用 Gemma 4 的原生函数调用能力驱动整个 Agent 系统：
 
 ```
-用户输入 "想吃麦当劳但我在减肥"
+用户输入 "想吃麦当劳但我在减肥，预算 25"
     │
-    ▼
+    ▼ Gemma 4 分析意图 → 选择 Agent 组合
+    │
+    ├── 🔥 减脂Agent → get_nutrition() → 热量 563kcal，超出目标
+    ├── 💰 预算Agent → calculate_price() → ¥42，超出 ¥25 预算
+    ├── 🥗 营养Agent → 知识库检索 → 缺少膳食纤维
+    └── 🍫 食欲Agent → memory.get_habits() → 用户心情低落需满足感
+    │
+    ▼ DebateEngine 4 阶段辩论
+    │
+    💪 自律: 板烧鸡腿堡 + 玉米杯 = 333kcal / ¥22
+    💰 省钱: 1+1 随心配 = 490kcal / ¥12.9
+    🍔 犒劳: 双层安格斯 = 1003kcal / ¥38（建议明天轻食）
+```
+
+### Agent Memory（长期习惯学习）
+
+```python
+# 三层记忆架构
+短期记忆 → 当前对话上下文（内存）
+中期记忆 → 用餐记录 + 偏好反馈（SQLite meal_records）
+长期记忆 → 行为模式 + 习惯画像（SQLite habit_patterns）
+
+# 每次决策时召回
+[Memory] 召回习惯: 偏好=[辣味, 高蛋白], 回避=[生菜]
+[Memory] 检测模式: 工作日倾向控制预算 (置信度 0.85)
+[Orchestrator] 基于记忆 → 增加减脂Agent和预算Agent权重
+```
+
+### Tool Calling（自主下单闭环）
+
+```python
+# 通过麦当劳 MCP (Model Context Protocol) 接入真实 API
+search_menu(keyword="鸡腿堡")     # → 营养Agent获取餐品数据
+get_nutrition(code="big_mac")     # → 减脂Agent计算热量
+calculate_price(items, store)     # → 预算Agent检查是否超支
+create_order(items, store, ...)   # → 用户确认后自主下单
+```
+
+---
+
+## 🏗️ 核心架构
+
+### 多 Agent 协作 + 4 阶段圆桌辩论
+
+```
 MealDecisionFlow (场景检测 + 记忆召回)
     │
     ▼
 SupervisorAgent
-    ├── OrchestratorAgent (Gemma 4 智能调度 → 选 3-5 个相关 Agent)
+    ├── OrchestratorAgent (Gemma 4 智能调度 → 选 3-5 个 Agent)
     │       │
     │       ▼ asyncio.gather() 并行分析
     │   [档案] [减脂] [营养] [预算] [食欲] [时间] [安全] [未来模拟]
     │       │
     │       ▼
-    │   DebateEngine (4 阶段圆桌辩论)
-    │       ├── 第一轮：各 Agent 发表初始意见
-    │       ├── 第二轮：发现冲突（减脂 vs 食欲、预算 vs 营养）
-    │       ├── 第三轮：形成妥协方案
-    │       └── 第四轮：最终投票
+    │   DebateEngine (4 阶段辩论)
+    │       ├── R1: 各 Agent 发表初始意见（基于数据 + 知识库）
+    │       ├── R2: Gemma 4 发现冲突（减脂vs食欲、预算vs营养）
+    │       ├── R3: 形成妥协方案（Gemma 4 主持）
+    │       └── R4: 各 Agent 最终投票（全票/多数通过）
     │       │
     │       ▼
     │   3 个方案: 💪自律 / 💰省钱 / 🍔犒劳
     │
     ▼
-AutoDraftService → 自动生成订单草稿
+AutoDraftService → 自动生成订单草稿（MCP Tool Calling）
 ```
 
-### Agent Memory 实现
+### Agent 列表
 
-```python
-# memory_service.py — 饮食习惯长期记忆
-class MemoryService:
-    """基于 SQLite 的饮食习惯学习引擎"""
-
-    async def record_preference(self, user_id, food, rating):
-        """记录每次用餐反馈，构建偏好画像"""
-
-    async def get_habits(self, user_id):
-        """召回用户习惯：偏好口味、回避食材、预算模式、用餐时段"""
-
-    async def detect_pattern(self, user_id):
-        """检测行为模式：如 '工作日倾向重口味'、'周末放松控制'"""
-```
-
-记忆在每次决策时被召回，影响 Orchestrator 的 Agent 选择权重和各 Agent 的分析基线。
-
-### Tool Calling 实现
-
-```python
-# mcdonalds_mcp_provider.py — 麦当劳 MCP 接入
-class McDonaldsMCPProvider(FoodProvider):
-    """通过 Model Context Protocol 接入真实麦当劳 API"""
-
-    async def search_menu(self, keyword: str) -> list[Meal]:
-        """搜索菜单 → Gemma 4 Function Calling 触发"""
-
-    async def get_nutrition(self, product_code: str) -> Nutrition:
-        """获取营养成分 → 营养 Agent 分析用"""
-
-    async def calculate_price(self, items, store_code) -> PriceResult:
-        """计算价格（含优惠） → 预算 Agent 用"""
-
-    async def create_order(self, items, store_code, ...) -> OrderResult:
-        """创建订单 → 用户确认后自主下单"""
-```
-
-Agent 通过 Gemma 4 的 Function Calling 自动选择合适的工具：
-- `search_menu` → 营养 Agent 需要餐品数据
-- `get_nutrition` → 减脂 Agent 计算热量
-- `calculate_price` → 预算 Agent 检查是否超支
-- `create_order` → 用户确认后自主下单
+| Agent | 职责 | Function Calling |
+|-------|------|------------------|
+| 🧑 档案Agent | 分析用户画像 | `get_user_profile` |
+| 🔥 减脂Agent | 热量目标 & 减脂策略 | `calculate_tdee` |
+| 🥗 营养Agent | 营养素评估 | `get_nutrition` |
+| 💰 预算Agent | 预算控制 | `calculate_price` |
+| 🍫 食欲Agent | 情绪性进食分析 | 记忆检索 |
+| ⏰ 时间Agent | 时间压力评估 | `get_meals` |
+| ⚠️ 安全Agent | 过敏 & 饮食安全 | 安全规则匹配 |
+| 🔮 未来模拟Agent | 用餐后影响预测 | 热量-预算平衡模型 |
 
 ---
 
-## 技术栈
+## 🚀 快速启动
 
-| 层 | 技术 | 说明 |
-|----|------|------|
-| **LLM** | Google Gemini API → Gemma 4 31B Dense | 原生 Function Calling |
-| **后端** | Python 3.12 + FastAPI | 异步 Agent 编排 |
-| **前端** | Vue 3 + Vite 6 + TypeScript | 响应式 UI |
-| **数据库** | SQLAlchemy + aiosqlite | 用户档案 + 饮食记忆 |
-| **Agent 框架** | Google ADK 2.1 | Agent Development Kit |
-| **外部工具** | 麦当劳 MCP | Model Context Protocol |
-| **UI** | Tailwind CSS + shadcn-vue | 组件库 |
-| **部署** | Docker Compose | 一键启动 |
-
----
-
-## 快速启动
-
-### 方式 A：Docker 一键启动（推荐）
+### 方式 A：Docker 一键启动（推荐，适合评审）
 
 ```bash
-# 1. 配置环境变量
+# 1. 配置环境变量（只需填一个必填项）
 cp .env.example .env
-# 编辑 .env，填入 GEMINI_API_KEY（必填）
+# 编辑 .env，将 GEMINI_API_KEY 改为你的 Key
 
 # 2. 一键启动
 docker compose up -d --build
 
 # 3. 访问
 # 前端: http://localhost:5173
-# 后端: http://localhost:8000/health
+# 后端健康检查: http://localhost:8000/health
 ```
 
 ### 方式 B：本地开发
 
 ```bash
-# 后端
+# 后端（终端 1）
 cd apps/api
 pip install -r requirements.txt
+cp ../../.env.example ../../.env    # 填入 GEMINI_API_KEY
 uvicorn main:app --host 127.0.0.1 --port 8000
 
-# 前端 (另一个终端)
+# 前端（终端 2）
 cd apps/web
 pnpm install
 pnpm dev
 ```
 
-访问 http://localhost:5173
+访问 http://localhost:5173，Vite 自动代理 `/api` → `localhost:8000`。
 
-### 终端点餐（Claude Code Skill）
+### 方式 C：终端点餐（Claude Code Skill）
 
 ```powershell
-# 安装 skill + 权限
+# 1. 安装 skill
 .\scripts\claude-setup\install.ps1
 
-# 使用
-帮我点午餐     # AI 推荐 + 辩论 + 下单
-领券           # 自动领取麦当劳优惠券
+# 2. 在 Claude Code 中直接说
+帮我点午餐     # → AI 推荐 + 辩论 + 查门店 + 下单
+领券           # → 自动领取麦当劳优惠券
 ```
 
-### 环境变量
+---
 
-| 变量 | 必填 | 说明 |
-|------|------|------|
-| `GEMINI_API_KEY` | ✅ | [Google AI Studio](https://aistudio.google.com/apikey) 获取 |
-| `GEMINI_MODEL` | ❌ | 默认 `gemma-4-31b-it` |
-| `MCD_MCP_TOKEN` | ❌ | 麦当劳 MCP Token（无则用 Mock 数据） |
-| `DATABASE_URL` | ❌ | 默认 `sqlite+aiosqlite:///./data/eatornot.db` |
+## ⚙️ 环境变量详细配置
+
+复制 `.env.example` 为 `.env` 后按需填写：
+
+```bash
+cp .env.example .env
+```
+
+### 必填项
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `GEMINI_API_KEY` | `""` | **（必填）** Google AI Studio API Key。在 [aistudio.google.com/apikey](https://aistudio.google.com/apikey) 免费获取。项目通过 OpenAI 兼容协议直连 Gemini API 调用 Gemma 4 31B。 |
+
+### LLM 配置（可选）
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `GEMINI_MODEL` | `gemma-4-31b-it` | Gemma 模型 ID。可选 `gemma-4-12b-it` 等其他 Gemma 4 系列模型 |
+| `CF_AIG_TOKEN` | `""` | Cloudflare AI Gateway Token（备用链路）。仅当 Gemini API 直连不可用时配置 |
+| `CF_AIG_BASE_URL` | `"https://gateway.ai.cloudflare.com/v1/..."` | CF AI Gateway 地址，配合 `CF_AIG_TOKEN` 使用 |
+
+### 麦当劳 MCP（可选）
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `MCD_MCP_TOKEN` | `""` | 麦当劳 MCP Token。在 [mcp.mcd.cn](https://mcp.mcd.cn) 获取。**不配置时自动使用 Mock 数据**，项目仍可正常运行（只是菜单和价格为模拟数据） |
+| `MCD_MCP_URL` | `https://mcp.mcd.cn` | 麦当劳 MCP 服务地址，一般无需修改 |
+| `USE_MOCK_MCP` | `true` | 是否使用 Mock 数据。设为 `false` 且配置了 `MCD_MCP_TOKEN` 时使用真实麦当劳 API |
+
+> 💡 **快速体验**：只需 `GEMINI_API_KEY` 即可启动。麦当劳 MCP 为可选增强，Mock 模式下所有功能均可演示。
+
+### 应用配置（可选）
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `DATABASE_URL` | `sqlite+aiosqlite:///./eatornot.db` | SQLite 数据库路径。Docker 模式下自动持久化到 `./data/` |
+| `APP_NAME` | `EatOrNot` | 应用名称 |
+| `DEBUG` | `true` | 调试模式，开启详细日志输出 |
+| `CORS_ORIGINS` | `http://localhost:5173,...` | 跨域白名单，逗号分隔。Docker 模式下 nginx 反代无需跨域 |
+
+### Web Push 通知（可选）
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `VAPID_PUBLIC_KEY` | `""` | VAPID 公钥，用于浏览器推送。生成方式：`npx web-push generate-vapid-keys` |
+| `VAPID_PRIVATE_KEY` | `""` | VAPID 私钥 |
+| `VAPID_SUBJECT` | `""` | 推送联系人，格式 `mailto:you@example.com` |
 
 ---
 
-## Agent 列表
-
-| Agent | 职责 | Gemma 4 Function Calling |
-|-------|------|--------------------------|
-| 🧑 档案Agent | 分析用户画像 | 调用 `get_user_profile` |
-| 🔥 减脂Agent | 热量目标 & 减脂策略 | 调用 `calculate_tdee` |
-| 🥗 营养Agent | 营养素评估 | 调用 `get_nutrition` |
-| 💰 预算Agent | 预算控制 | 调用 `calculate_price` |
-| 🍫 食欲Agent | 情绪性进食分析 | 记忆检索 |
-| ⏰ 时间Agent | 时间压力评估 | 调用 `get_meals` |
-| ⚠️ 安全Agent | 过敏 & 饮食安全 | 安全规则匹配 |
-| 🔮 未来模拟Agent | 用餐后影响预测 | 热量-预算平衡模型 |
-
----
-
-## 项目结构
+## 📁 项目结构
 
 ```
 eatornot/
-├── apps/api/                          # FastAPI 后端
-│   ├── agents/                        # Agent 层 (核心)
-│   │   ├── orchestrator_agent.py      # LLM 智能调度器
-│   │   ├── supervisor_agent.py        # 方案构建器
-│   │   ├── debate_engine.py           # 4 阶段圆桌辩论
-│   │   └── 8 个专业 Agent
-│   ├── services/                      # 业务服务
-│   │   ├── memory_service.py          # 饮食习惯长期记忆 ★
-│   │   ├── meal_decision_flow.py      # Dual-Trigger 决策流
-│   │   └── auto_draft_service.py      # 自动订单草稿
-│   ├── providers/                     # 食物数据源
-│   │   ├── mcdonalds_mcp_provider.py  # 麦当劳 MCP ★
-│   │   └── mock_mcdonalds_provider.py # Mock 降级
-│   └── core/
-│       └── llm_client.py              # Gemma 4 调用封装
-├── apps/web/                          # Vue 3 前端
-├── knowledge/                         # 营养学知识库 (115 条)
-├── skills/                            # ADK Skills (5 个)
-└── scripts/claude-setup/             # 终端点餐 Skill
+├── apps/api/                              # FastAPI 后端
+│   ├── agents/                            # ★ Agent 层 (核心)
+│   │   ├── orchestrator_agent.py          #   Gemma 4 智能调度器 (Function Calling)
+│   │   ├── supervisor_agent.py            #   方案构建器 + 辩论编排
+│   │   ├── debate_engine.py               #   4 阶段圆桌辩论引擎
+│   │   ├── weight_loss_agent.py           #   减脂策略 Agent
+│   │   ├── nutrition_agent.py             #   营养评估 Agent
+│   │   ├── budget_agent.py                #   预算控制 Agent
+│   │   └── ... (共 8 个专业 Agent)
+│   ├── services/
+│   │   ├── memory_service.py              # ★ Agent Memory (饮食习惯学习)
+│   │   ├── meal_decision_flow.py          #   Dual-Trigger 统一决策流
+│   │   └── auto_draft_service.py          #   自动订单草稿
+│   ├── providers/
+│   │   ├── mcdonalds_mcp_provider.py      # ★ Tool Calling (麦当劳 MCP)
+│   │   └── mock_mcdonalds_provider.py     #   Mock 降级
+│   ├── core/
+│   │   └── llm_client.py                  #   Gemma 4 调用 (OpenAI 兼容协议)
+│   └── api/                               #   12 个路由模块
+├── apps/web/                              # Vue 3 + Vite 6 前端
+│   └── src/components/                    #   25+ 组件 (辩论可视化/仪表盘/...)
+├── knowledge/                             # 营养学知识库 (115 条)
+│   ├── nutrition.json                     #   《中国食物成分表》核心数据
+│   ├── nutrition_guidelines/              #   《中国居民膳食指南》规则
+│   ├── safety/                            #   过敏原 + 安全规则
+│   └── weight_loss/                       #   BMI/TDEE/热量缺口规则
+├── skills/                                # Google ADK Skills (5 个)
+├── scripts/claude-setup/                  # 终端点餐 Skill 安装
+└── docker-compose.yml                     # Docker 一键部署
 ```
 
 ★ = 赛道 A 重点考察文件
 
 ---
 
-## 运行日志示例
+## 🔍 运行日志展示
 
-### Agent Memory 记忆学习
+### Agent Memory（记忆学习）
 
 ```
 [Memory] 记录用餐反馈: user=dev_coder, food=巨无霸, rating=4
@@ -222,28 +252,30 @@ eatornot/
 [Orchestrator] 基于记忆增加减脂Agent和预算Agent权重
 ```
 
-### Tool Calling 工具调用
+### Tool Calling（工具调用链）
 
 ```
-[NutritionAgent] 调用 get_nutrition(product_code="big_mac")
-  → 热量: 563kcal, 蛋白质: 33g, 脂肪: 33g, 碳水: 39g
+[NutritionAgent] Function Call → get_nutrition(product_code="big_mac")
+  Response → 热量: 563kcal, 蛋白质: 33g, 脂肪: 33g, 碳水: 39g
 
-[BudgetAgent] 调用 calculate_price(items=[...], store_code="12345")
-  → 总价: ¥42.00, 可用优惠券: 满减券-¥5
+[BudgetAgent] Function Call → calculate_price(items=[...], store_code="12345")
+  Response → 总价: ¥42.00, 可用优惠券: 满减券-¥5
 
-[OrderDraft] 调用 create_order(items=[...], store_code="12345")
-  → 订单创建成功, order_id=ORD20260607001
+[OrderDraft] Function Call → create_order(items=[...], store_code="12345")
+  Response → 订单创建成功, order_id=ORD20260607001
 ```
 
 ---
 
-## 文档
+## 📚 文档
 
-- [技术报告](TECHNICAL_REPORT.md) — 模型选型与架构设计
-- [架构文档](docs/architecture.md) — 详细系统架构
-- [演示视频脚本](docs/demo_video_script.md) — 5 分钟 demo 流程
-- [开发指南](CLAUDE.md) — 项目结构与协作规范
+| 文档 | 说明 |
+|------|------|
+| [技术报告](TECHNICAL_REPORT.md) | 模型选型 (Gemma 4 31B) + 架构设计 + 特性利用深度 |
+| [架构文档](docs/architecture.md) | 详细系统架构设计 |
+| [演示视频脚本](docs/demo_video_script.md) | 5 分钟 demo 流程 |
+| [开发指南](CLAUDE.md) | 项目结构 + 协作规范 |
 
 ## License
 
-MIT
+[MIT](LICENSE)
